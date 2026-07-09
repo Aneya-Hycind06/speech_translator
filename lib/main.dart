@@ -57,7 +57,7 @@ class _SpeechScreenState extends State<SpeechScreen> {
   bool _isTranslatingTop = false;
   bool _isTranslatingBottom = false;
 
-  static const String _apiKey = 'AIzaSyCuHDGdtncRsr7e7nF1yRIqDkRYzFYh6Yo';
+  static const String _apiKey = 'API KEY';
 
   final Map<String, String> _translateCodes = {
     'English': 'en',
