@@ -159,8 +159,11 @@ class _SpeechScreenState extends State<SpeechScreen>
   // Which side is currently speaking. true = Language A (left dropdown).
   bool _activeIsTop = true;
   bool _isListening = false;
+  bool _isRestartingListening = false;
   bool _isTranslating = false;
   String _currentSpoken = '';
+  String _accumulatedSpoken = '';
+  String _lastPartial = '';
 
   final List<ChatMessage> _messages = [];
 
@@ -172,7 +175,7 @@ class _SpeechScreenState extends State<SpeechScreen>
   String _quickSource = '';
   ChatMessage? _quickResult;
 
-  static const String _apiKey = 'API key';
+  static const String _apiKey = 'YOUR_API_KEY_HERE';
 
   final Map<String, String> _translateCodes = {
     'English': 'en',
@@ -195,23 +198,23 @@ class _SpeechScreenState extends State<SpeechScreen>
   };
 
   final Map<String, String> _speechLocales = {
-    'English': 'en_US',
-    'Hindi': 'hi_IN',
-    'Tamil': 'ta_IN',
-    'Telugu': 'te_IN',
-    'Kannada': 'kn_IN',
-    'Malayalam': 'ml_IN',
-    'Bengali': 'bn_IN',
-    'Marathi': 'mr_IN',
-    'Gujarati': 'gu_IN',
-    'Punjabi': 'pa_IN',
-    'Urdu': 'ur_PK',
-    'Spanish': 'es_ES',
-    'French': 'fr_FR',
-    'German': 'de_DE',
-    'Japanese': 'ja_JP',
-    'Chinese': 'zh_CN',
-    'Arabic': 'ar_SA',
+    'English': 'en-US',
+    'Hindi': 'hi-IN',
+    'Tamil': 'ta-IN',
+    'Telugu': 'te-IN',
+    'Kannada': 'kn-IN',
+    'Malayalam': 'ml-IN',
+    'Bengali': 'bn-IN',
+    'Marathi': 'mr-IN',
+    'Gujarati': 'gu-IN',
+    'Punjabi': 'pa-IN',
+    'Urdu': 'ur-PK',
+    'Spanish': 'es-ES',
+    'French': 'fr-FR',
+    'German': 'de-DE',
+    'Japanese': 'ja-JP',
+    'Chinese': 'zh-CN',
+    'Arabic': 'ar-SA',
   };
 
   String _selectedLanguageTop = 'Hindi';
@@ -312,15 +315,63 @@ class _SpeechScreenState extends State<SpeechScreen>
 
   Future<void> _initSpeech() async {
     bool available = await _speech.initialize(
-      onError: (error) {
-        _endRecordingUi();
-      },
-      onStatus: (status) {
-        if (status == 'done' || status == 'notListening') {
+      onError: (error) async {
+        print('[STT-DEBUG] onError: ${error.errorMsg} | isListening: $_isListening');
+        if (_isListening && !_isRestartingListening) {
+          _isRestartingListening = true;
+          if (_currentSpoken.trim().isNotEmpty) {
+            _accumulatedSpoken = _currentSpoken.trim();
+          }
+          await Future.delayed(const Duration(milliseconds: 250));
+          if (_isListening) {
+            await _startListening(keepAccumulated: true);
+          }
+          _isRestartingListening = false;
+        } else if (!_isListening) {
           _endRecordingUi();
         }
       },
+      onStatus: (status) async {
+        print('[STT-DEBUG] onStatus: $status | isListening: $_isListening');
+        if (status == 'done' || status == 'notListening') {
+          if (_isListening && !_isRestartingListening) {
+            _isRestartingListening = true;
+            if (_currentSpoken.trim().isNotEmpty) {
+              _accumulatedSpoken = _currentSpoken.trim();
+            }
+            await Future.delayed(const Duration(milliseconds: 250));
+            if (_isListening) {
+              await _startListening(keepAccumulated: true);
+            }
+            _isRestartingListening = false;
+          } else if (!_isListening) {
+            _endRecordingUi();
+          }
+        }
+      },
     );
+    if (available) {
+      try {
+        final locales = await _speech.locales();
+        for (final entry in _translateCodes.entries) {
+          final langName = entry.key;
+          final code = entry.value;
+          for (final l in locales) {
+            final locId = l.localeId;
+            if (locId.toLowerCase().startsWith(code.toLowerCase()) ||
+                locId.toLowerCase().startsWith('${code}_'.toLowerCase()) ||
+                locId.toLowerCase().startsWith('$code-'.toLowerCase())) {
+              _speechLocales[langName] = locId;
+              break;
+            }
+          }
+        }
+        print('[STT-DEBUG] Resolved speech locales: $_speechLocales');
+      } catch (e) {
+        print('[STT-DEBUG] Locales resolution error: $e');
+      }
+    }
+
     if (!mounted) return;
     setState(() => _isInitialized = available);
   }
@@ -328,6 +379,7 @@ class _SpeechScreenState extends State<SpeechScreen>
   // Stops the recording timer and the ripple/waveform loops. Safe to call
   // more than once — the plugin fires both onStatus and our own stop.
   void _endRecordingUi() {
+    print('[STT-DEBUG] _endRecordingUi called');
     _recordWatch.stop();
     _rippleCtrl.stop();
     _waveCtrl.stop();
@@ -359,8 +411,7 @@ class _SpeechScreenState extends State<SpeechScreen>
     return voices[locale] ?? 'en-US-Chirp3-HD-Aoede';
   }
 
-  Future<void> _speak(String text, String language,
-      {double rate = 1.0}) async {
+  Future<void> _speak(String text, String language, {double rate = 1.0}) async {
     final Map<String, String> ttsLocales = {
       'English': 'en-US',
       'Hindi': 'hi-IN',
@@ -429,49 +480,116 @@ class _SpeechScreenState extends State<SpeechScreen>
     }
   }
 
-  Future<void> _startListening() async {
+  Future<void> _startListening({bool keepAccumulated = false}) async {
     if (!_isInitialized) await _initSpeech();
 
     final activeLang =
         _activeIsTop ? _selectedLanguageTop : _selectedLanguageBottom;
     final localeId = _speechLocales[activeLang]!;
 
+    print('[STT-DEBUG] _startListening | keepAccumulated: $keepAccumulated | beforeAccumulated: "$_accumulatedSpoken" | beforeCurrent: "$_currentSpoken"');
+
+    // Save existing spoken text into _accumulatedSpoken so pauses never erase previous words
+    if (_currentSpoken.trim().isNotEmpty) {
+      _accumulatedSpoken = _currentSpoken.trim();
+    }
+
     setState(() {
       _isListening = true;
-      _currentSpoken = '';
     });
 
-    _soundLevel = 0;
-    _recordWatch
-      ..reset()
-      ..start();
-    _rippleCtrl.repeat();
-    _waveCtrl.repeat();
+    if (!keepAccumulated) {
+      _accumulatedSpoken = '';
+      _currentSpoken = '';
+      _lastPartial = '';
+    }
 
-    await _speech.listen(
-      onResult: (SpeechRecognitionResult result) {
-        setState(() => _currentSpoken = result.recognizedWords);
-      },
-      // Feeds the waveform. No setState — the wave controller already
-      // repaints every frame while listening.
-      onSoundLevelChange: (level) {
-        final normalised = ((level + 2) / 12).clamp(0.0, 1.0);
-        _soundLevel = _soundLevel * 0.7 + normalised * 0.3;
-      },
-      localeId: localeId,
-      listenFor: const Duration(seconds: 60),
-      pauseFor: const Duration(seconds: 60),
-      partialResults: true,
-    );
+    if (!keepAccumulated) {
+      _soundLevel = 0;
+      _recordWatch
+        ..reset()
+        ..start();
+      _rippleCtrl.repeat();
+      _waveCtrl.repeat();
+    }
+
+    try {
+      await _speech.stop();
+    } catch (_) {}
+
+    try {
+      await _speech.listen(
+        onResult: (SpeechRecognitionResult result) {
+          final newWords = result.recognizedWords.trim();
+          if (newWords.isEmpty) return;
+
+          // Detect if native STT started a new phrase batch after a silence pause
+          if (_lastPartial.isNotEmpty &&
+              !newWords.toLowerCase().startsWith(_lastPartial.toLowerCase())) {
+            if (_currentSpoken.trim().isNotEmpty) {
+              _accumulatedSpoken = _currentSpoken.trim();
+            }
+          }
+
+          _lastPartial = newWords;
+
+          final activeLang =
+              _activeIsTop ? _selectedLanguageTop : _selectedLanguageBottom;
+          final code = _translateCodes[activeLang] ?? 'en';
+          final needsSpace = (code != 'zh' && code != 'ja');
+
+          final combined = _accumulatedSpoken.isEmpty
+              ? newWords
+              : (needsSpace
+                      ? '$_accumulatedSpoken $newWords'
+                      : '$_accumulatedSpoken$newWords')
+                  .trim();
+
+          print('[STT-DEBUG] onResult | lang: $activeLang ($code) | newWords: "$newWords" | finalResult: ${result.finalResult} | combined: "$combined"');
+
+          if (mounted) {
+            setState(() {
+              _currentSpoken = combined;
+            });
+          }
+
+          if (result.finalResult && newWords.isNotEmpty) {
+            _accumulatedSpoken = combined;
+            _lastPartial = '';
+          }
+        },
+        // Feeds the waveform. No setState — the wave controller already
+        // repaints every frame while listening.
+        onSoundLevelChange: (level) {
+          final normalised = ((level + 2) / 12).clamp(0.0, 1.0);
+          _soundLevel = _soundLevel * 0.7 + normalised * 0.3;
+        },
+        localeId: localeId,
+        listenFor: const Duration(seconds: 60),
+        pauseFor: const Duration(seconds: 60),
+        partialResults: true,
+        listenMode: ListenMode.dictation,
+      );
+    } catch (e) {
+      print('[STT-DEBUG] Listen attempt error: $e');
+    }
   }
 
   Future<void> _stopListening() async {
+    print('[STT-DEBUG] _stopListening called | currentSpoken: "$_currentSpoken" | accumulatedSpoken: "$_accumulatedSpoken"');
+    setState(() => _isListening = false);
     await _speech.stop();
-    await Future.delayed(const Duration(milliseconds: 500));
+    await Future.delayed(const Duration(milliseconds: 300));
     if (!mounted) return;
     _endRecordingUi();
 
     final text = _currentSpoken.trim();
+
+    // Clear accumulated and current spoken string when the mic is let go
+    _accumulatedSpoken = '';
+    _currentSpoken = '';
+    _lastPartial = '';
+
     if (text.isNotEmpty) {
       if (_conversationMode) {
         await _translateAndAdd(text);
@@ -616,9 +734,8 @@ class _SpeechScreenState extends State<SpeechScreen>
     return Scaffold(
       backgroundColor: _c.bg,
       body: SafeArea(
-        child: _conversationMode
-            ? _buildConversation()
-            : _buildQuickTranslate(),
+        child:
+            _conversationMode ? _buildConversation() : _buildQuickTranslate(),
       ),
     );
   }
@@ -829,8 +946,7 @@ class _SpeechScreenState extends State<SpeechScreen>
                               fontSize: 15,
                               fontWeight:
                                   selected ? FontWeight.w700 : FontWeight.w500,
-                              color:
-                                  selected ? _c.accentText : _c.textPrimary,
+                              color: selected ? _c.accentText : _c.textPrimary,
                             ),
                           ),
                         ),
@@ -987,9 +1103,7 @@ class _SpeechScreenState extends State<SpeechScreen>
           bottomLeft: Radius.circular(isLeft ? 6 : 20),
           bottomRight: Radius.circular(isLeft ? 20 : 6),
         ),
-        border: isLeft
-            ? null
-            : Border.all(color: _c.accent.withOpacity(0.35)),
+        border: isLeft ? null : Border.all(color: _c.accent.withOpacity(0.35)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1172,7 +1286,8 @@ class _SpeechScreenState extends State<SpeechScreen>
           return Row(
             children: [
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
                 decoration: BoxDecoration(
                   color: _c.accent.withOpacity(dark ? 0.16 : 0.10),
                   borderRadius: BorderRadius.circular(20),
@@ -1378,9 +1493,8 @@ class _SpeechScreenState extends State<SpeechScreen>
               style: TextStyle(
                 fontSize: 14,
                 height: 1.3,
-                color: _currentSpoken.isEmpty
-                    ? _c.textSecondary
-                    : _c.textPrimary,
+                color:
+                    _currentSpoken.isEmpty ? _c.textSecondary : _c.textPrimary,
               ),
             ),
           ),
@@ -1491,9 +1605,7 @@ class _SpeechScreenState extends State<SpeechScreen>
 
     final content = _isTranslating
         ? 'Translating…'
-        : (result == null
-            ? 'The translation will appear here…'
-            : result.text);
+        : (result == null ? 'The translation will appear here…' : result.text);
     final isPlaceholder = result == null;
 
     return Container(
@@ -1520,8 +1632,7 @@ class _SpeechScreenState extends State<SpeechScreen>
                 ),
                 const SizedBox(width: 12),
                 GestureDetector(
-                  onTap: () =>
-                      _speak(result.text, result.language, rate: 0.5),
+                  onTap: () => _speak(result.text, result.language, rate: 0.5),
                   child: Icon(Icons.slow_motion_video_rounded,
                       color: _c.accentText, size: _iconAction),
                 ),
@@ -1551,7 +1662,6 @@ class _SpeechScreenState extends State<SpeechScreen>
 
   // Copy / Share / Pin / Favourite for a single message.
   void _showMessageActions(ChatMessage msg) {
-
     showModalBottomSheet(
       context: context,
       backgroundColor: _c.surface,
@@ -1600,9 +1710,7 @@ class _SpeechScreenState extends State<SpeechScreen>
                 _snack('Share coming soon');
               }),
               _actionTile(
-                msg.isPinned
-                    ? Icons.push_pin_rounded
-                    : Icons.push_pin_outlined,
+                msg.isPinned ? Icons.push_pin_rounded : Icons.push_pin_outlined,
                 msg.isPinned ? 'Unpin' : 'Pin',
                 () {
                   Navigator.pop(ctx);
@@ -1721,8 +1829,7 @@ class _SpeechScreenState extends State<SpeechScreen>
         _activeIsTop = !msg.isLeft;
       }
     });
-    final lang =
-        _activeIsTop ? _selectedLanguageTop : _selectedLanguageBottom;
+    final lang = _activeIsTop ? _selectedLanguageTop : _selectedLanguageBottom;
     _snack('Removed — hold the mic to redo ($lang)');
   }
 
@@ -1734,7 +1841,6 @@ class _SpeechScreenState extends State<SpeechScreen>
 
   // Settings sheet: shows pinned messages and favourites.
   void _openSaved() {
-
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
